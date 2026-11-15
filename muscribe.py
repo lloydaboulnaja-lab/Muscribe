@@ -113,6 +113,12 @@ class MuscribeApp(ctk.CTk):
         )
         self.file_label.pack(padx=20, pady=5)
 
+        # Compile Button
+        self.compile_btn = ctk.CTkButton(
+            self.sidebar_frame, text="Compile to Sheet Music", command=self.compile_score, fg_color="#1f538d"
+        )
+        self.compile_btn.pack(padx=20, pady=(20, 10), fill="x")
+
         # Main Content Canvas Area (Right side)
         self.main_area = ctk.CTkFrame(self, fg_color="#000000", corner_radius=0)
         self.main_area.pack(side="right", expand=True, fill="both")
@@ -132,11 +138,43 @@ class MuscribeApp(ctk.CTk):
             self.selected_midi_path = Path(file_path)
             self.file_label.configure(text=f"Loaded: {self.selected_midi_path.name}", text_color="#FFFFFF")
             try:
-                # Parse MIDI stream using music21 converter
                 self.score_stream = converter.parse(str(self.selected_midi_path))
                 print(f"[INFO] Successfully parsed MIDI stream: {self.selected_midi_path.name}")
             except Exception as e:
                 messagebox.showerror("Parsing Error", f"Failed to parse MIDI file:\n{e}")
+
+    def compile_score(self) -> None:
+        """Export the parsed score to LilyPond format and compile it into sheet music."""
+        if not self.score_stream:
+            messagebox.showwarning("No Score", "Please load and parse a MIDI file first.")
+            return
+
+        if not self.lilypond_path:
+            messagebox.showerror("LilyPond Missing", "LilyPond executable path could not be found.")
+            return
+
+        try:
+            # Ensure output directory exists
+            output_dir = Path(__file__).resolve().parent / "output"
+            output_dir.mkdir(exist_ok=True)
+
+            ly_path = output_dir / "output_score.ly"
+
+            # Write music21 stream out to a LilyPond file format
+            self.score_stream.write('lily', fp=str(ly_path))
+            print(f"[INFO] Exported LilyPond file to: {ly_path}")
+
+            # Execute LilyPond compiler via subprocess
+            cmd = [self.lilypond_path, f"--output={output_dir / 'output_score'}", str(ly_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            print(f"[INFO] LilyPond compilation successful: {result.stdout}")
+            messagebox.showinfo("Success", f"Sheet music compiled successfully!\nSaved to: {output_dir}")
+
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Compilation Error", f"LilyPond failed to compile:\n{e.stderr}")
+        except Exception as e:
+            messagebox.showerror("Error", f"An unexpected error occurred during compilation:\n{e}")
 
 
 if __name__ == "__main__":
