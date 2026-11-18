@@ -76,6 +76,8 @@ class MuscribeApp(ctk.CTk):
         # Application state variables
         self.selected_midi_path: Path | None = None
         self.score_stream: m21stream.Score | None = None
+        self.batch_running: bool = False
+        self.events: queue.Queue = queue.Queue()
 
         # Locate LilyPond on startup and configure music21 environment
         self.lilypond_path = locate_lilypond()
@@ -86,8 +88,9 @@ class MuscribeApp(ctk.CTk):
         else:
             print("[WARNING] LilyPond executable not found.")
 
-        # Build user interface layout
+        # Build user interface layout and start background event polling
         self.setup_ui()
+        self.after(100, self._process_events)
 
     def setup_ui(self) -> None:
         """Create the sidebar control panel and main workspace area."""
@@ -105,7 +108,17 @@ class MuscribeApp(ctk.CTk):
         self.select_btn = ctk.CTkButton(
             self.sidebar_frame, text="Select MIDI File", command=self.load_midi_file
         )
-        self.select_btn.pack(padx=20, pady=10, fill="x")
+        self.select_btn.pack(padx=20, pady=(10, 6), fill="x")
+
+        # Batch Convert Folder Button
+        self.batch_btn = ctk.CTkButton(
+            self.sidebar_frame,
+            text="Batch Convert Folder",
+            command=self.open_batch_folder,
+            fg_color="#2a2a2a",
+            hover_color="#3a3a3a",
+        )
+        self.batch_btn.pack(padx=20, pady=(0, 10), fill="x")
 
         # File Status Label
         self.file_label = ctk.CTkLabel(
@@ -130,6 +143,9 @@ class MuscribeApp(ctk.CTk):
 
     def load_midi_file(self) -> None:
         """Open a file dialog to select a MIDI file and parse it using music21."""
+        if self.batch_running:
+            return
+
         file_path = filedialog.askopenfilename(
             title="Select MIDI File",
             filetypes=[("MIDI Files", "*.mid *.midi"), ("All Files", "*.*")]
@@ -142,6 +158,87 @@ class MuscribeApp(ctk.CTk):
                 print(f"[INFO] Successfully parsed MIDI stream: {self.selected_midi_path.name}")
             except Exception as e:
                 messagebox.showerror("Parsing Error", f"Failed to parse MIDI file:\n{e}")
+
+    def open_batch_folder(self) -> None:
+        """Select a folder of MIDI files and compile all of them in a background thread."""
+        if self.batch_running:
+            return
+
+        if not self.lilypond_path:
+            messagebox.showerror("LilyPond Missing", "LilyPond executable path could not be found.")
+            return
+
+        folder = filedialog.askdirectory(title="Select Folder Containing MIDI Files")
+        if not folder:
+            return
+
+        folder_path = Path(folder)
+        midi_files = sorted(list(folder_path.glob("*.mid")) + list(folder_path.glob("*.midi")))
+        if not midi_files:
+            messagebox.showinfo("No MIDI Files", "No .mid or .midi files were found in that folder.")
+            return
+
+        self.batch_running = True
+        self.select_btn.configure(state="disabled")
+        self.batch_btn.configure(state="disabled")
+        self.compile_btn.configure(state="disabled")
+
+        threading.Thread(
+            target=self._batch_worker,
+            args=(midi_files,),
+            daemon=True,
+        ).start()
+
+    def _batch_worker(self, midi_files: list[Path]) -> None:
+        """Background worker that parses and compiles each MIDI file sequentially."""
+        output_dir = Path(__file__).resolve().parent / "output"
+        output_dir.mkdir(exist_ok=True)
+
+        success_count = 0
+        fail_count = 0
+        total = len(midi_files)
+
+        for idx, midi_path in enumerate(midi_files, start=1):
+            self.events.put(("progress", f"Batch ({idx}/{total}): {midi_path.name}"))
+            try:
+                parsed_stream = converter.parse(str(midi_path))
+                stem = midi_path.stem
+                ly_path = output_dir / f"{stem}.ly"
+                parsed_stream.write("lily", fp=str(ly_path))
+
+                cmd = [self.lilypond_path, f"--output={output_dir / stem}", str(ly_path)]
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                success_count += 1
+            except Exception as exc:
+                fail_count += 1
+                print(f"[ERROR] Batch failed for {midi_path.name}: {exc}")
+
+        self.events.put(("batch_finished", (success_count, fail_count, total, output_dir)))
+
+    def _process_events(self) -> None:
+        """Poll the thread-safe event queue to update UI status safely."""
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "progress":
+                    self.file_label.configure(text=payload, text_color="#FFFFFF")
+                elif kind == "batch_finished":
+                    success, fail, total, output_dir = payload
+                    self.batch_running = False
+                    self.select_btn.configure(state="normal")
+                    self.batch_btn.configure(state="normal")
+                    self.compile_btn.configure(state="normal")
+                    self.file_label.configure(
+                        text=f"Batch done: {success}/{total} compiled", text_color="#FFFFFF"
+                    )
+                    messagebox.showinfo(
+                        "Batch Conversion Complete",
+                        f"Processed {total} files.\nSuccessful: {success}\nFailed: {fail}\n\nSaved to:\n{output_dir}",
+                    )
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._process_events)
 
     def compile_score(self) -> None:
         """Export the parsed score to LilyPond format and compile it into sheet music."""
