@@ -1,17 +1,18 @@
 """
-Muscribe — Commit 4: Algorithmic Notation Refinement: Quantisation & Grand Staff Splitting
-Git Commit: feat(notation): add rhythm quantisation grids and automatic grand staff splitting
+Muscribe — Commit 5: Score Metadata Modal & Direct LilyPond Preamble Header Patching
+Git Commit: fix(engraving): patch lilypond header to resolve single-page layout and inject score metadata
 
 Features:
-- Configurable quantisation dropdown: Off, Gentle, Balanced, Detailed
-- Automatic Grand Staff splitting for wide piano spans (> 19 semitones)
-- Separates treble right hand and bass left hand onto two clefs
-- Greatly cleans up human performance timing noise (tested on Jazz Cafe Loop)
+- Score metadata configuration dialog (Title and Composer)
+- Regular expression patch removing music21's default 'lilypond-book-preamble.ly'
+- Eliminates unwanted page split, unifying Title, Composer, and music onto Page 1
+- Automatic injection of a custom LilyPond header block with tagline suppression
 """
 
 from __future__ import annotations
 
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -21,7 +22,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 from music21 import clef as m21clef
-from music21 import converter, environment, meter
+from music21 import converter, environment, metadata
 from music21 import stream as m21stream
 
 ctk.set_appearance_mode("dark")
@@ -52,19 +53,44 @@ def locate_lilypond() -> str | None:
     return None
 
 
+def _patch_lilypond_header(ly_path: Path, title: str | None, composer: str | None) -> None:
+    """Strips music21 LaTeX snippet preamble and writes clean header metadata."""
+    text = ly_path.read_text(encoding="utf-8")
+
+    # Fix: strip preamble include that forces title onto a separate page
+    text = re.sub(r'\s*\\include "lilypond-book-preamble\.ly"\n', "\n", text)
+
+    # Clean header block
+    header_lines = ["\\header {"]
+    if title:
+        safe_title = str(title).replace("\\", "\\\\").replace('"', '\\"')
+        header_lines.append(f'  title = "{safe_title}"')
+    if composer:
+        safe_composer = str(composer).replace("\\", "\\\\").replace('"', '\\"')
+        header_lines.append(f'  composer = "{safe_composer}"')
+    header_lines.append('  tagline = ##f')  # Suppress default footer
+    header_lines.append("}")
+    header_block = "\n".join(header_lines) + "\n"
+
+    # Replace existing header or prepend new header
+    if "\\header {" in text:
+        text = re.sub(r'\\header\s*\{[^}]*\}', header_block, text, count=1)
+    else:
+        text = header_block + text
+
+    ly_path.write_text(text, encoding="utf-8")
+
+
 def _split_wide_parts(score, max_span=19):
-    """Splits wide-ranging piano parts across Treble and Bass staves."""
     for part in list(score.parts):
-        # Extract MIDI note pitches
         pitches = sorted({pitch.midi for n in part.recurse().notes for pitch in n.pitches})
         if not pitches or pitches[-1] - pitches[0] <= max_span:
             continue
 
-        # Find optimal Middle C split point with widest clearance
         split = None
         best_gap = 0
         for candidate in range(pitches[0] + 1, pitches[-1]):
-            if candidate % 12 != 0:  # Prefer C notes
+            if candidate % 12 != 0:
                 continue
             below = [p for p in pitches if p < candidate]
             above = [p for p in pitches if p > candidate]
@@ -82,7 +108,6 @@ def _split_wide_parts(score, max_span=19):
 
         for n in part.recurse().notes:
             offset = n.getOffsetInHierarchy(part)
-            # Notice: Baseline pitch extraction before unpitched drum check
             lowest = min(p.midi for p in n.pitches)
             if lowest < split:
                 bass.insert(offset, n)
@@ -92,22 +117,61 @@ def _split_wide_parts(score, max_span=19):
         treble.insert(0, m21clef.TrebleClef())
         bass.insert(0, m21clef.BassClef())
 
-        # Replace original part with grand staff parts
         score.remove(part)
         score.insert(0, treble)
         score.insert(0, bass)
+
+
+class MetadataDialog(ctk.CTkToplevel):
+    def __init__(self, parent, current_title: str, current_composer: str, on_save):
+        super().__init__(parent)
+        self.title("Score Metadata")
+        self.geometry("420x280")
+        self.resizable(False, False)
+        self.configure(fg_color="#151D2B")
+        self.transient(parent)
+        self.grab_set()
+        self.on_save = on_save
+
+        ctk.CTkLabel(self, text="Score Metadata", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color="#F8FAFC").pack(anchor="w", padx=20, pady=(20, 10))
+
+        ctk.CTkLabel(self, text="Title", text_color="#9CA3AF").pack(anchor="w", padx=20)
+        self.title_entry = ctk.CTkEntry(self, width=380, fg_color="#0F1724")
+        self.title_entry.pack(padx=20, pady=(4, 10))
+        self.title_entry.insert(0, current_title)
+
+        ctk.CTkLabel(self, text="Composer", text_color="#9CA3AF").pack(anchor="w", padx=20)
+        self.composer_entry = ctk.CTkEntry(self, width=380, fg_color="#0F1724")
+        self.composer_entry.pack(padx=20, pady=(4, 16))
+        self.composer_entry.insert(0, current_composer)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(10, 20))
+
+        ctk.CTkButton(btn_row, text="Cancel", fg_color="#2a2a2a", command=self.destroy).pack(side="left", expand=True, padx=(0, 5))
+        ctk.CTkButton(btn_row, text="Save", fg_color="#4BC6B9", text_color="#090D14", command=self.save).pack(side="right", expand=True, padx=(5, 0))
+
+    def save(self):
+        t = self.title_entry.get().strip() or "Untitled Score"
+        c = self.composer_entry.get().strip() or "Unknown Composer"
+        self.on_save(t, c)
+        self.destroy()
 
 
 class MuscribeApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Muscribe — Quantisation & Grand Staff (Commit 4)")
+        self.title("Muscribe — Metadata & Single Page (Commit 5)")
         self.geometry("1100x700")
         self.configure(fg_color="#0F1724")
 
         self.selected_midi_path: Path | None = None
         self.generated_pdf_path: Path | None = None
+        self.score_title = "Untitled Score"
+        self.score_composer = "Lloyd Aboulnaja"
+
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events: queue.Queue = queue.Queue()
@@ -140,11 +204,15 @@ class MuscribeApp(ctk.CTk):
         )
         self.file_label.pack(padx=20, pady=5)
 
-        # Quantisation Rhythm Grid Selector
+        self.meta_btn = ctk.CTkButton(
+            self.sidebar, text="Edit Metadata...", command=self.open_metadata_modal, fg_color="#2a2a2a"
+        )
+        self.meta_btn.pack(padx=20, pady=(5, 10), fill="x")
+
         self.rhythm_label = ctk.CTkLabel(
             self.sidebar, text="Rhythm Quantisation:", text_color="#F8FAFC", font=ctk.CTkFont(size=12, weight="bold")
         )
-        self.rhythm_label.pack(padx=20, pady=(15, 2), anchor="w")
+        self.rhythm_label.pack(padx=20, pady=(10, 2), anchor="w")
 
         self.rhythm_var = ctk.StringVar(value="Balanced")
         self.rhythm_menu = ctk.CTkOptionMenu(
@@ -182,6 +250,13 @@ class MuscribeApp(ctk.CTk):
         self.placeholder_label.pack(expand=True, pady=100)
         self.preview_images: list[ctk.CTkImage] = []
 
+    def open_metadata_modal(self) -> None:
+        def on_save(t, c):
+            self.score_title = t
+            self.score_composer = c
+            self.status_label.configure(text="Metadata updated", text_color="#4BC6B9")
+        MetadataDialog(self, self.score_title, self.score_composer, on_save)
+
     def load_midi_file(self) -> None:
         if self.is_compiling:
             return
@@ -192,8 +267,9 @@ class MuscribeApp(ctk.CTk):
         if file_path:
             self.selected_midi_path = Path(file_path)
             self.file_label.configure(text=f"Loaded: {self.selected_midi_path.name}", text_color="#F8FAFC")
+            self.score_title = self.selected_midi_path.stem.replace("_", " ").title()
             self.export_btn.configure(state="disabled")
-            self.status_label.configure(text="MIDI Ready for Compilation", text_color="#4BC6B9")
+            self.status_label.configure(text="MIDI Ready", text_color="#4BC6B9")
 
     def start_compilation(self) -> None:
         if self.is_compiling or not self.selected_midi_path:
@@ -204,18 +280,19 @@ class MuscribeApp(ctk.CTk):
 
         self.is_compiling = True
         self.select_btn.configure(state="disabled")
+        self.meta_btn.configure(state="disabled")
         self.compile_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
-        self.status_label.configure(text="Starting Algorithmic Processing...", text_color="#FBBF24")
+        self.status_label.configure(text="Processing...", text_color="#FBBF24")
 
         rhythm_mode = self.rhythm_var.get()
         threading.Thread(
             target=self._compile_worker,
-            args=(self.selected_midi_path, rhythm_mode),
+            args=(self.selected_midi_path, rhythm_mode, self.score_title, self.score_composer),
             daemon=True
         ).start()
 
-    def _compile_worker(self, midi_path: Path, rhythm_mode: str) -> None:
+    def _compile_worker(self, midi_path: Path, rhythm_mode: str, title: str, composer: str) -> None:
         try:
             stem = midi_path.stem
             ly_path = self.output_dir / f"{stem}.ly"
@@ -234,6 +311,10 @@ class MuscribeApp(ctk.CTk):
 
             self.events.put(("status", "Writing LilyPond file..."))
             score.write("lily", fp=str(ly_path))
+
+            # Patch preamble and inject clean header metadata
+            self.events.put(("status", "Patching single-page layout & metadata..."))
+            _patch_lilypond_header(ly_path, title, composer)
 
             self.events.put(("status", "Pass 1/2: Compiling Vector PDF..."))
             cmd_pdf = [self.lilypond_path, f"--output={self.output_dir / stem}", str(ly_path)]
@@ -258,6 +339,7 @@ class MuscribeApp(ctk.CTk):
                 elif kind == "error":
                     self.is_compiling = False
                     self.select_btn.configure(state="normal")
+                    self.meta_btn.configure(state="normal")
                     self.compile_btn.configure(state="normal")
                     self.status_label.configure(text="Compilation Failed", text_color="#F87171")
                     messagebox.showerror("Compilation Error", data)
@@ -266,9 +348,10 @@ class MuscribeApp(ctk.CTk):
                     self.is_compiling = False
                     self.generated_pdf_path = pdf_path
                     self.select_btn.configure(state="normal")
+                    self.meta_btn.configure(state="normal")
                     self.compile_btn.configure(state="normal")
                     self.export_btn.configure(state="normal", fg_color="#10B981")
-                    self.status_label.configure(text="Score Ready!", text_color="#10B981")
+                    self.status_label.configure(text="Single-Page Score Ready!", text_color="#10B981")
                     self._display_preview(png_files)
         except queue.Empty:
             pass
