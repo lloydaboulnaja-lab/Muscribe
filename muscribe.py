@@ -1,12 +1,12 @@
 """
-Muscribe — Commit 5: Score Metadata Modal & Direct LilyPond Preamble Header Patching
-Git Commit: fix(engraving): patch lilypond header to resolve single-page layout and inject score metadata
+Muscribe — Commit 6: Audio Playback & MIDI Auditioning Engine
+Git Commit: feat(audio): integrate pygame mixer for in-app MIDI preview with play pause and stop controls
 
 Features:
-- Score metadata configuration dialog (Title and Composer)
-- Regular expression patch removing music21's default 'lilypond-book-preamble.ly'
-- Eliminates unwanted page split, unifying Title, Composer, and music onto Page 1
-- Automatic injection of a custom LilyPond header block with tagline suppression
+- Seamless background MIDI playback via pygame.mixer
+- Play / Pause / Resume and Stop controls integrated in the control panel
+- Audio state decoupled from sheet music rendering so users can audition while viewing
+- Graceful degradation with clear fallback warnings if sound drivers or pygame are absent
 """
 
 from __future__ import annotations
@@ -24,6 +24,11 @@ from PIL import Image
 from music21 import clef as m21clef
 from music21 import converter, environment, metadata
 from music21 import stream as m21stream
+
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -177,6 +182,12 @@ class MuscribeApp(ctk.CTk):
         self.events: queue.Queue = queue.Queue()
         self.is_compiling = False
 
+        # Initialize audio engine
+        self.audio_ready = False
+        self.audio_playing = False
+        self.audio_paused = False
+        self._init_audio()
+
         self.lilypond_path = locate_lilypond()
         if self.lilypond_path:
             us = environment.UserSettings()
@@ -208,6 +219,22 @@ class MuscribeApp(ctk.CTk):
             self.sidebar, text="Edit Metadata...", command=self.open_metadata_modal, fg_color="#2a2a2a"
         )
         self.meta_btn.pack(padx=20, pady=(5, 10), fill="x")
+
+        # Audio Playback Controls
+        self.audio_frame = ctk.CTkFrame(self.sidebar, fg_color="#0F1724", corner_radius=6)
+        self.audio_frame.pack(padx=20, pady=5, fill="x")
+
+        self.play_btn = ctk.CTkButton(
+            self.audio_frame, text="Play MIDI", command=self.toggle_audio,
+            fg_color="#10B981", state="disabled", width=110
+        )
+        self.play_btn.pack(side="left", padx=(5, 2), pady=6, expand=True)
+
+        self.stop_btn = ctk.CTkButton(
+            self.audio_frame, text="Stop", command=self.stop_audio,
+            fg_color="#EF4444", state="disabled", width=110
+        )
+        self.stop_btn.pack(side="right", padx=(2, 5), pady=6, expand=True)
 
         self.rhythm_label = ctk.CTkLabel(
             self.sidebar, text="Rhythm Quantisation:", text_color="#F8FAFC", font=ctk.CTkFont(size=12, weight="bold")
@@ -250,6 +277,51 @@ class MuscribeApp(ctk.CTk):
         self.placeholder_label.pack(expand=True, pady=100)
         self.preview_images: list[ctk.CTkImage] = []
 
+
+    def _init_audio(self) -> None:
+        if pygame is None:
+            return
+        try:
+            pygame.mixer.init()
+            self.audio_ready = True
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize audio mixer: {e}")
+            self.audio_ready = False
+
+    def toggle_audio(self) -> None:
+        if not self.audio_ready or not self.selected_midi_path:
+            return
+        try:
+            if not self.audio_playing:
+                pygame.mixer.music.load(str(self.selected_midi_path))
+                pygame.mixer.music.play()
+                self.audio_playing = True
+                self.audio_paused = False
+                self.play_btn.configure(text="Pause MIDI", fg_color="#F59E0B")
+                self.stop_btn.configure(state="normal")
+            elif self.audio_paused:
+                pygame.mixer.music.unpause()
+                self.audio_paused = False
+                self.play_btn.configure(text="Pause MIDI", fg_color="#F59E0B")
+            else:
+                pygame.mixer.music.pause()
+                self.audio_paused = True
+                self.play_btn.configure(text="Resume MIDI", fg_color="#10B981")
+        except Exception as e:
+            messagebox.showwarning("Audio Error", f"Audio playback failed:\n{e}")
+
+    def stop_audio(self) -> None:
+        if not self.audio_ready:
+            return
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self.audio_playing = False
+        self.audio_paused = False
+        self.play_btn.configure(text="Play MIDI", fg_color="#10B981")
+        self.stop_btn.configure(state="disabled")
+
     def open_metadata_modal(self) -> None:
         def on_save(t, c):
             self.score_title = t
@@ -267,6 +339,9 @@ class MuscribeApp(ctk.CTk):
         if file_path:
             self.selected_midi_path = Path(file_path)
             self.file_label.configure(text=f"Loaded: {self.selected_midi_path.name}", text_color="#F8FAFC")
+            self.stop_audio()
+            if self.audio_ready:
+                self.play_btn.configure(state="normal", text="Play MIDI", fg_color="#10B981")
             self.score_title = self.selected_midi_path.stem.replace("_", " ").title()
             self.export_btn.configure(state="disabled")
             self.status_label.configure(text="MIDI Ready", text_color="#4BC6B9")
