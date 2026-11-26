@@ -1,16 +1,17 @@
 """
-Muscribe — Commit 2: Asynchronous Multi-Threading & Embedded Canvas Preview
-Git Commit: feat(concurrency): offload compilation to worker thread and add score preview canvas
+Muscribe — Commit 3: Decoupled Dual-Pass Engraving & Robust Output File Validation
+Git Commit: fix(compiler): decouple vector PDF export from raster preview and add file validation
 
 Features:
-- Background compilation thread preventing desktop UI freezing
-- Thread-safe queue.Queue event dispatching
-- Embedded preview canvas on the right side using PIL and CustomTkinter
-- Progress and status indicators
+- Decoupled two-pass LilyPond pipeline: Pass 1 (vector PDF) and Pass 2 (raster PNG previews)
+- Strict file validation: checks file existence and non-zero byte size
+- Graceful degradation: treats valid PDF as success even if raster previews fail
+- "Export PDF" button enabled upon successful compilation
 """
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import subprocess
@@ -47,12 +48,13 @@ class MuscribeApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
 
-        self.title("Muscribe — Async Threading & Preview (Commit 2)")
+        self.title("Muscribe — Dual-Pass Validation (Commit 3)")
         self.geometry("1100x700")
         self.configure(fg_color="#0F1724")
 
         self.selected_midi_path: Path | None = None
         self.score_stream = None
+        self.generated_pdf_path: Path | None = None
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events: queue.Queue = queue.Queue()
@@ -91,6 +93,11 @@ class MuscribeApp(ctk.CTk):
         )
         self.compile_btn.pack(padx=20, pady=(20, 10), fill="x")
 
+        self.export_btn = ctk.CTkButton(
+            self.sidebar, text="Export PDF Score", command=self.export_pdf, fg_color="#2a2a2a", state="disabled"
+        )
+        self.export_btn.pack(padx=20, pady=(0, 10), fill="x")
+
         self.status_label = ctk.CTkLabel(
             self.sidebar, text="Ready", text_color="#4BC6B9", font=ctk.CTkFont(size=12)
         )
@@ -120,17 +127,15 @@ class MuscribeApp(ctk.CTk):
         if file_path:
             self.selected_midi_path = Path(file_path)
             self.file_label.configure(text=f"Loaded: {self.selected_midi_path.name}", text_color="#F8FAFC")
+            self.export_btn.configure(state="disabled")
             try:
                 self.score_stream = converter.parse(str(self.selected_midi_path))
-                self.status_label.configure(text="MIDI Loaded Successfully", text_color="#4BC6B9")
+                self.status_label.configure(text="MIDI Loaded", text_color="#4BC6B9")
             except Exception as e:
                 messagebox.showerror("Parsing Error", f"Failed to parse MIDI:\n{e}")
 
     def start_compilation(self) -> None:
-        if self.is_compiling:
-            return
-        if not self.score_stream or not self.selected_midi_path:
-            messagebox.showwarning("No Score", "Please select a valid MIDI file first.")
+        if self.is_compiling or not self.score_stream or not self.selected_midi_path:
             return
         if not self.lilypond_path:
             messagebox.showerror("LilyPond Missing", "LilyPond executable path could not be found.")
@@ -139,34 +144,43 @@ class MuscribeApp(ctk.CTk):
         self.is_compiling = True
         self.select_btn.configure(state="disabled")
         self.compile_btn.configure(state="disabled")
-        self.status_label.configure(text="Compiling in background...", text_color="#FBBF24")
+        self.export_btn.configure(state="disabled")
+        self.status_label.configure(text="Starting Dual-Pass Compilation...", text_color="#FBBF24")
 
-        # Launch background worker thread
         threading.Thread(
-            target=self._compile_worker,
+            target=self._dual_pass_worker,
             args=(self.selected_midi_path, self.score_stream),
             daemon=True
         ).start()
 
-    def _compile_worker(self, midi_path: Path, stream) -> None:
+    def _dual_pass_worker(self, midi_path: Path, stream) -> None:
         try:
             stem = midi_path.stem
             ly_path = self.output_dir / f"{stem}.ly"
+            pdf_path = self.output_dir / f"{stem}.pdf"
 
-            self.events.put(("status", "Exporting LilyPond syntax..."))
+            self.events.put(("status", "Generating LilyPond source..."))
             stream.write("lily", fp=str(ly_path))
 
-            self.events.put(("status", "Invoking LilyPond compiler..."))
-            # Initial compilation command attempting PNG output
-            cmd = [self.lilypond_path, "--png", f"-dresolution=150", f"--output={self.output_dir / stem}", str(ly_path)]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Pass 1: Render vector PDF
+            self.events.put(("status", "Pass 1/2: Compiling Vector PDF..."))
+            cmd_pdf = [self.lilypond_path, f"--output={self.output_dir / stem}", str(ly_path)]
+            res_pdf = subprocess.run(cmd_pdf, capture_output=True, text=True)
+            if res_pdf.returncode != 0:
+                raise RuntimeError(f"PDF compilation failed:\n{res_pdf.stderr}")
 
-            # Discover generated preview PNGs
+            # Validate PDF output file
+            if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+                raise FileNotFoundError(f"PDF was reported created but missing or empty: {pdf_path}")
+
+            # Pass 2: Render raster PNG previews for GUI
+            self.events.put(("status", "Pass 2/2: Rendering Preview Images..."))
+            cmd_png = [self.lilypond_path, "--png", "-dresolution=150", f"--output={self.output_dir / stem}", str(ly_path)]
+            res_png = subprocess.run(cmd_png, capture_output=True, text=True)
+
             png_files = sorted(list(self.output_dir.glob(f"{stem}*.png")))
-            self.events.put(("success", (png_files, stem)))
+            self.events.put(("success", (pdf_path, png_files, res_png.returncode == 0)))
 
-        except subprocess.CalledProcessError as err:
-            self.events.put(("error", f"LilyPond exited with code {err.returncode}:\n{err.stderr}"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
@@ -183,19 +197,24 @@ class MuscribeApp(ctk.CTk):
                     self.status_label.configure(text="Compilation Failed", text_color="#F87171")
                     messagebox.showerror("Compilation Error", data)
                 elif kind == "success":
-                    png_files, stem = data
+                    pdf_path, png_files, png_ok = data
                     self.is_compiling = False
+                    self.generated_pdf_path = pdf_path
                     self.select_btn.configure(state="normal")
                     self.compile_btn.configure(state="normal")
-                    self.status_label.configure(text="Compilation Succeeded!", text_color="#4BC6B9")
+                    self.export_btn.configure(state="normal", fg_color="#10B981")
+
+                    pdf_kb = pdf_path.stat().st_size // 1024
+                    self.status_label.configure(text=f"PDF Ready ({pdf_kb} KB)", text_color="#10B981")
                     self._display_preview(png_files)
+                    if not png_ok:
+                        messagebox.showwarning("Preview Warning", "PDF created successfully, but preview rendering had warnings.")
         except queue.Empty:
             pass
         finally:
             self.after(100, self._process_events)
 
     def _display_preview(self, png_files: list[Path]) -> None:
-        # Clear existing widgets
         for child in self.preview_scroll.winfo_children():
             child.destroy()
         self.preview_images.clear()
@@ -207,7 +226,6 @@ class MuscribeApp(ctk.CTk):
 
         for img_path in png_files:
             pil_img = Image.open(img_path)
-            # Calculate display scale
             max_width = 750
             scale = min(1.0, max_width / pil_img.width)
             disp_size = (int(pil_img.width * scale), int(pil_img.height * scale))
@@ -216,6 +234,21 @@ class MuscribeApp(ctk.CTk):
 
             img_label = ctk.CTkLabel(self.preview_scroll, image=ctk_img, text="")
             img_label.pack(pady=10)
+
+    def export_pdf(self) -> None:
+        if not self.generated_pdf_path or not self.generated_pdf_path.is_file():
+            messagebox.showwarning("No PDF", "No compiled PDF is available for export.")
+            return
+
+        dest = filedialog.asksaveasfilename(
+            title="Save Sheet Music PDF",
+            defaultextension=".pdf",
+            initialfile=self.generated_pdf_path.name,
+            filetypes=[("PDF Document", "*.pdf")]
+        )
+        if dest:
+            shutil.copy(str(self.generated_pdf_path), dest)
+            messagebox.showinfo("Exported", f"Saved PDF to:\n{dest}")
 
 
 if __name__ == "__main__":
